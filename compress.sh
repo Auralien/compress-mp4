@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="2.0.0"
 
 # --- Defaults ---
 CRF=24
@@ -18,6 +18,7 @@ REPLACE=false
 DRY_RUN=false
 FORCE=false
 AUDIO_BITRATE="128k"
+SOFTWARE=false
 
 # --- Colors ---
 if [[ -t 1 ]]; then
@@ -77,6 +78,7 @@ OPTIONS:
         --replace             Delete originals after successful conversion
         --force               Re-convert all files, ignoring previous completions
         --dry-run             Show what would happen without converting
+        --software            Use software encoder (libx265) instead of hardware
     -h, --help                Show this help
     -v, --version             Show version
 
@@ -128,6 +130,8 @@ parse_args() {
                 DRY_RUN=true; shift ;;
             --force)
                 FORCE=true; shift ;;
+            --software)
+                SOFTWARE=true; shift ;;
             -h|--help)
                 usage; exit 0 ;;
             -v|--version)
@@ -252,9 +256,18 @@ print_header() {
     echo "  │                compress-mp4 v${VERSION}                        │"
     echo "  └──────────────────────────────────────────────────────────┘"
     echo -e "${NC}"
-    echo -e "  ${DIM}Codec:${NC}      H.265 (HEVC)"
-    echo -e "  ${DIM}CRF:${NC}        ${BOLD}${CRF}${NC}"
-    echo -e "  ${DIM}Preset:${NC}     ${BOLD}${PRESET}${NC}"
+    if $SOFTWARE; then
+        echo -e "  ${DIM}Codec:${NC}      H.265 (HEVC) via libx265 (software)"
+        echo -e "  ${DIM}CRF:${NC}        ${BOLD}${CRF}${NC}"
+        echo -e "  ${DIM}Preset:${NC}     ${BOLD}${PRESET}${NC}"
+    else
+        local vtq_display
+        vtq_display=$(( 100 - (CRF * 100 / 51) ))
+        [[ $vtq_display -lt 1 ]] && vtq_display=1
+        [[ $vtq_display -gt 100 ]] && vtq_display=100
+        echo -e "  ${DIM}Codec:${NC}      H.265 (HEVC) via VideoToolbox (hardware)"
+        echo -e "  ${DIM}CRF:${NC}        ${BOLD}${CRF}${NC} (VT quality: ${vtq_display})"
+    fi
     if [[ $MAX_WIDTH -gt 0 ]]; then
         echo -e "  ${DIM}Max width:${NC}  ${BOLD}${MAX_WIDTH}px${NC}"
     else
@@ -439,10 +452,28 @@ convert_file() {
     # Run ffmpeg in background with machine-readable progress output
     # Stderr goes to a log file so interrupt noise doesn't leak to terminal
     local error_log="${temp}.err"
+    # Build encoder args
+    local encoder_args=()
+    if $SOFTWARE; then
+        encoder_args=(
+            -c:v libx265 -crf "$CRF" -preset "$PRESET"
+            -x265-params log-level=error
+            -tag:v hvc1
+        )
+    else
+        # Map CRF (0-51, lower=better) to VideoToolbox quality (1-100, higher=better)
+        local vtq
+        vtq=$(( 100 - (CRF * 100 / 51) ))
+        [[ $vtq -lt 1 ]] && vtq=1
+        [[ $vtq -gt 100 ]] && vtq=100
+        encoder_args=(
+            -c:v hevc_videotoolbox -q:v "$vtq"
+            -tag:v hvc1
+        )
+    fi
+
     ffmpeg -loglevel error -progress "$progress_file" -i "$input" \
-        -c:v libx265 -crf "$CRF" -preset "$PRESET" \
-        -x265-params log-level=error \
-        -tag:v hvc1 \
+        "${encoder_args[@]}" \
         "${vf_args[@]}" \
         -c:a aac -b:a "$AUDIO_BITRATE" \
         -movflags +faststart \
