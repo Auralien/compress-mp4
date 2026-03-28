@@ -908,7 +908,8 @@ main() {
 
                         # Draw compact bar
                         local bw=20
-                        local filled=$((p_pct * bw / 100)) empty=$((bw - filled))
+                        local filled=$((p_pct * bw / 100))
+                        local empty=$((bw - filled))
                         local bar=""
                         local i
                         for ((i=0; i<filled; i++)); do bar+="\xe2\x96\x88"; done
