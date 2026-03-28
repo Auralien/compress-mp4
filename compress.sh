@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# compress.sh - compress-mp4: Batch MP4 compressor using H.265/HEVC
+# compress.sh - compress-mp4: Batch video compressor using H.265/HEVC
 #
-# Converts MP4 videos to H.265/HEVC with optional downscaling.
+# Converts MP4/MOV videos to H.265/HEVC with optional downscaling.
 # Supports resume — stop anytime and restart to pick up where you left off.
 
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 # --- Defaults ---
 CRF=24
@@ -58,11 +58,11 @@ usage() {
     cat <<EOF
 Usage: ./compress.sh [OPTIONS] [FILE ...]
 
-Batch compress MP4 videos using H.265/HEVC.
+Batch compress MP4/MOV videos using H.265/HEVC.
 
-If no files are given, all .mp4 files in the current directory are processed.
+If no files are given, all .mp4 and .mov files in the current directory are processed.
 If one or more files are given, only those files are processed.
-Compressed files are written to an output directory. The script tracks
+Compressed files are written to an output directory (always as .mp4). The script tracks
 completed files, so you can stop it anytime (Ctrl+C) and resume later.
 
 OPTIONS:
@@ -437,6 +437,7 @@ convert_file() {
         vf_args=(-vf "scale='min(${MAX_WIDTH},iw)':-2")
     fi
 
+    rm -f "$temp"
     CURRENT_TEMP="$temp"
     local progress_file="${temp}.progress"
     CURRENT_PROGRESS="$progress_file"
@@ -474,7 +475,7 @@ convert_file() {
 
     ffmpeg -loglevel error -progress "$progress_file" -i "$input" \
         "${encoder_args[@]}" \
-        "${vf_args[@]}" \
+        ${vf_args[@]+"${vf_args[@]}"} \
         -c:a aac -b:a "$AUDIO_BITRATE" \
         -movflags +faststart \
         -n \
@@ -526,9 +527,13 @@ convert_file() {
 
     if [[ $exit_code -ne 0 ]]; then
         # Show error log for real failures (not interrupts)
-        if [[ $exit_code -ne 130 && $exit_code -ne 255 && -s "$error_log" ]]; then
-            echo -e "  ${RED}ffmpeg error:${NC}"
-            cat "$error_log" >&2
+        if [[ $exit_code -ne 130 && $exit_code -ne 255 ]]; then
+            if [[ -s "$error_log" ]]; then
+                echo -e "  ${RED}ffmpeg error:${NC}"
+                cat "$error_log" >&2
+            else
+                echo -e "  ${RED}ffmpeg exited with code ${exit_code} (no error output)${NC}"
+            fi
         fi
         rm -f "$temp" "$error_log"
         CURRENT_TEMP=""
@@ -593,7 +598,7 @@ main() {
             files+=("$f")
         done
     else
-        for f in *.mp4; do
+        for f in *.mp4 *.mov *.MOV *.MP4; do
             [[ -f "$f" ]] || continue
             [[ "$f" == *.tmp.mp4 ]] && continue
             files+=("$f")
@@ -601,7 +606,7 @@ main() {
     fi
 
     if [[ ${#files[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}No .mp4 files found in the current directory.${NC}"
+        echo -e "${YELLOW}No .mp4 or .mov files found in the current directory.${NC}"
         exit 0
     fi
 
@@ -624,16 +629,18 @@ main() {
     touch "$done_file"
 
     print_header
-    echo -e "  Found ${BOLD}${TOTAL_FILES}${NC} MP4 file(s)"
+    echo -e "  Found ${BOLD}${TOTAL_FILES}${NC} video file(s)"
 
     START_TIME=$(date +%s)
 
     local index=0
     for file in "${files[@]}"; do
         index=$((index + 1))
-        local filename
+        local filename output_name
         filename=$(basename "$file")
-        local output="${OUTPUT_DIR}/${filename}"
+        # Always output as .mp4 regardless of input format
+        output_name="${filename%.*}.mp4"
+        local output="${OUTPUT_DIR}/${output_name}"
 
         echo ""
         print_separator
