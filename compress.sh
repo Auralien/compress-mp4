@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="2.3.0"
+VERSION="2.4.0"
 
 # --- Defaults ---
 CRF=24
@@ -19,6 +19,7 @@ DRY_RUN=false
 FORCE=false
 AUDIO_BITRATE="128k"
 SOFTWARE=false
+JOBS=1
 
 # --- Colors ---
 if [[ -t 1 ]]; then
@@ -51,6 +52,7 @@ DRY_RUN_EST_HIGH=0
 DRY_RUN_WOULD_CONVERT=0
 DRY_RUN_DOWNSCALED=0
 INPUT_FILES=()
+CHILD_PIDS=()
 
 # --- Helpers ---
 
@@ -79,6 +81,7 @@ OPTIONS:
         --force               Re-convert all files, ignoring previous completions
         --dry-run             Show what would happen without converting
         --software            Use software encoder (libx265) instead of hardware
+    -j, --jobs <N>            Parallel conversions (for hardware encoder). Default: 1
     -h, --help                Show this help
     -v, --version             Show version
 
@@ -132,6 +135,9 @@ parse_args() {
                 FORCE=true; shift ;;
             --software)
                 SOFTWARE=true; shift ;;
+            -j|--jobs)
+                [[ -z "${2:-}" ]] && { echo "Error: --jobs requires a value" >&2; exit 1; }
+                JOBS="$2"; shift 2 ;;
             -h|--help)
                 usage; exit 0 ;;
             -v|--version)
@@ -275,6 +281,9 @@ print_header() {
     fi
     echo -e "  ${DIM}Audio:${NC}      AAC @ ${BOLD}${AUDIO_BITRATE}${NC}"
     echo -e "  ${DIM}Output:${NC}     ${BOLD}${OUTPUT_DIR}/${NC}"
+    if [[ $JOBS -gt 1 ]]; then
+        echo -e "  ${DIM}Jobs:${NC}       ${BOLD}${JOBS}${NC} parallel"
+    fi
     if $REPLACE; then
         echo -e "  ${DIM}Replace:${NC}    ${RED}${BOLD}yes — originals will be deleted${NC}"
     fi
@@ -344,21 +353,36 @@ cleanup() {
     echo ""
     echo -e "  ${YELLOW}Interrupted!${NC}"
 
-    if [[ -n "$FFMPEG_PID" ]] && kill -0 "$FFMPEG_PID" 2>/dev/null; then
-        kill "$FFMPEG_PID" 2>/dev/null || true
-        wait "$FFMPEG_PID" 2>/dev/null || true
-    fi
+    if [[ $JOBS -gt 1 ]]; then
+        # Kill all active child processes
+        for pid in "${CHILD_PIDS[@]+"${CHILD_PIDS[@]}"}"; do
+            kill "$pid" 2>/dev/null || true
+        done
+        for pid in "${CHILD_PIDS[@]+"${CHILD_PIDS[@]}"}"; do
+            wait "$pid" 2>/dev/null || true
+        done
+        # Clean up any leftover temp files
+        for tmp in "${OUTPUT_DIR}"/*.tmp.mp4; do
+            [[ -f "$tmp" ]] || continue
+            rm -f "$tmp" "${tmp}.progress" "${tmp}.err"
+        done
+    else
+        if [[ -n "$FFMPEG_PID" ]] && kill -0 "$FFMPEG_PID" 2>/dev/null; then
+            kill "$FFMPEG_PID" 2>/dev/null || true
+            wait "$FFMPEG_PID" 2>/dev/null || true
+        fi
 
-    # Clear progress bar line
-    printf "\r%80s\r" ""
+        # Clear progress bar line
+        printf "\r%80s\r" ""
 
-    if [[ -n "$CURRENT_PROGRESS" && -f "$CURRENT_PROGRESS" ]]; then
-        rm -f "$CURRENT_PROGRESS"
-    fi
+        if [[ -n "$CURRENT_PROGRESS" && -f "$CURRENT_PROGRESS" ]]; then
+            rm -f "$CURRENT_PROGRESS"
+        fi
 
-    if [[ -n "$CURRENT_TEMP" ]]; then
-        rm -f "$CURRENT_TEMP" "${CURRENT_TEMP}.err"
-        [[ -f "$CURRENT_TEMP" ]] || echo -e "  ${DIM}Cleaned up incomplete file${NC}"
+        if [[ -n "$CURRENT_TEMP" ]]; then
+            rm -f "$CURRENT_TEMP" "${CURRENT_TEMP}.err"
+            [[ -f "$CURRENT_TEMP" ]] || echo -e "  ${DIM}Cleaned up incomplete file${NC}"
+        fi
     fi
 
     print_summary
@@ -374,6 +398,7 @@ trap cleanup SIGINT SIGTERM
 convert_file() {
     local input="$1"
     local output="$2"
+    local result_file="${3:-}"
     local temp="${output}.tmp.mp4"
     local filename
     filename=$(basename "$input")
@@ -483,47 +508,56 @@ convert_file() {
 
     FFMPEG_PID=$!
 
-    # Poll progress file and draw progress bar
-    while kill -0 "$FFMPEG_PID" 2>/dev/null; do
-        if [[ -f "$progress_file" && $total_us -gt 0 ]]; then
-            local cur_us speed cur_bytes
-            eval "$(awk -F= '
-                /^out_time_us/{us=$2}
-                /^speed/{sp=$2}
-                /^total_size/{sz=$2}
-                END{printf "cur_us=%d speed=\"%s\" cur_bytes=%d", us+0, sp, sz+0}
-            ' "$progress_file" 2>/dev/null)"
-            speed=${speed// /}
+    if [[ $JOBS -gt 1 ]]; then
+        # Parallel mode: just wait, no progress bar
+        wait "$FFMPEG_PID"
+        local exit_code=$?
+        FFMPEG_PID=""
+        rm -f "$progress_file"
+        CURRENT_PROGRESS=""
+    else
+        # Poll progress file and draw progress bar
+        while kill -0 "$FFMPEG_PID" 2>/dev/null; do
+            if [[ -f "$progress_file" && $total_us -gt 0 ]]; then
+                local cur_us speed cur_bytes
+                eval "$(awk -F= '
+                    /^out_time_us/{us=$2}
+                    /^speed/{sp=$2}
+                    /^total_size/{sz=$2}
+                    END{printf "cur_us=%d speed=\"%s\" cur_bytes=%d", us+0, sp, sz+0}
+                ' "$progress_file" 2>/dev/null)"
+                speed=${speed// /}
 
-            if [[ -n "$cur_us" && "$cur_us" != "0" ]]; then
-                local pct=$(( cur_us * 100 / total_us ))
-                [[ $pct -gt 100 ]] && pct=100
+                if [[ -n "$cur_us" && "$cur_us" != "0" ]]; then
+                    local pct=$(( cur_us * 100 / total_us ))
+                    [[ $pct -gt 100 ]] && pct=100
 
-                local eta=0
-                local elapsed=$(( $(date +%s) - conv_start ))
-                if [[ $pct -gt 0 && $elapsed -gt 0 ]]; then
-                    eta=$(( elapsed * (100 - pct) / pct ))
+                    local eta=0
+                    local elapsed=$(( $(date +%s) - conv_start ))
+                    if [[ $pct -gt 0 && $elapsed -gt 0 ]]; then
+                        eta=$(( elapsed * (100 - pct) / pct ))
+                    fi
+
+                    local projected=0
+                    if [[ $pct -gt 2 && $cur_bytes -gt 0 ]]; then
+                        projected=$(( cur_bytes * 100 / pct ))
+                    fi
+
+                    draw_progress "$pct" "${speed:-?}" "$eta" "$projected"
                 fi
-
-                local projected=0
-                if [[ $pct -gt 2 && $cur_bytes -gt 0 ]]; then
-                    projected=$(( cur_bytes * 100 / pct ))
-                fi
-
-                draw_progress "$pct" "${speed:-?}" "$eta" "$projected"
             fi
-        fi
-        sleep 1
-    done
+            sleep 1
+        done
 
-    wait "$FFMPEG_PID"
-    local exit_code=$?
-    FFMPEG_PID=""
+        wait "$FFMPEG_PID"
+        local exit_code=$?
+        FFMPEG_PID=""
 
-    # Clear progress bar line and clean up progress file
-    printf "\r%80s\r" ""
-    rm -f "$progress_file"
-    CURRENT_PROGRESS=""
+        # Clear progress bar line and clean up progress file
+        printf "\r%80s\r" ""
+        rm -f "$progress_file"
+        CURRENT_PROGRESS=""
+    fi
 
     if [[ $exit_code -ne 0 ]]; then
         # Show error log for real failures (not interrupts)
@@ -537,6 +571,7 @@ convert_file() {
         fi
         rm -f "$temp" "$error_log"
         CURRENT_TEMP=""
+        [[ -n "$result_file" ]] && echo "fail" > "$result_file"
         return 1
     fi
 
@@ -560,8 +595,12 @@ convert_file() {
     echo -e "  ${GREEN}Done${NC} in $(format_duration $conv_elapsed)"
     echo -e "  ${DIM}New size:${NC}    $(human_size "$new_size") (${GREEN}${pct}%${NC} of original, saved ${GREEN}$(human_size $saved)${NC})"
 
-    TOTAL_ORIGINAL_SIZE=$((TOTAL_ORIGINAL_SIZE + orig_size))
-    TOTAL_COMPRESSED_SIZE=$((TOTAL_COMPRESSED_SIZE + new_size))
+    if [[ -n "$result_file" ]]; then
+        echo "ok $orig_size $new_size" > "$result_file"
+    else
+        TOTAL_ORIGINAL_SIZE=$((TOTAL_ORIGINAL_SIZE + orig_size))
+        TOTAL_COMPRESSED_SIZE=$((TOTAL_COMPRESSED_SIZE + new_size))
+    fi
 
     if $REPLACE; then
         rm "$input"
@@ -634,33 +673,105 @@ main() {
     START_TIME=$(date +%s)
 
     local index=0
-    for file in "${files[@]}"; do
-        index=$((index + 1))
-        local filename output_name
-        filename=$(basename "$file")
-        # Always output as .mp4 regardless of input format
-        output_name="${filename%.*}.mp4"
-        local output="${OUTPUT_DIR}/${output_name}"
 
-        echo ""
-        print_separator
-        echo -e "\n  ${BOLD}[${index}/${TOTAL_FILES}]${NC}"
+    if [[ $JOBS -gt 1 ]]; then
+        # --- Parallel mode ---
+        local results_dir="${OUTPUT_DIR}/.results"
+        rm -rf "$results_dir"
+        mkdir -p "$results_dir"
 
-        # Check if already converted
-        if ! $FORCE && grep -qxF "$filename" "$done_file" 2>/dev/null && [[ -f "$output" ]]; then
-            echo -e "  ${DIM}File:${NC}        ${filename}"
-            echo -e "  ${CYAN}Skipped (already converted)${NC}"
-            SKIPPED=$((SKIPPED + 1))
-            continue
-        fi
+        for file in "${files[@]}"; do
+            index=$((index + 1))
+            local filename output_name
+            filename=$(basename "$file")
+            output_name="${filename%.*}.mp4"
+            local output="${OUTPUT_DIR}/${output_name}"
 
-        if convert_file "$file" "$output"; then
-            PROCESSED=$((PROCESSED + 1))
-        else
-            echo -e "\n  ${RED}Failed to convert: ${filename}${NC}"
-            FAILED=$((FAILED + 1))
-        fi
-    done
+            # Check if already converted
+            if ! $FORCE && grep -qxF "$filename" "$done_file" 2>/dev/null && [[ -f "$output" ]]; then
+                echo -e "  ${CYAN}Skipped${NC} ${filename} (already converted)"
+                SKIPPED=$((SKIPPED + 1))
+                continue
+            fi
+
+            # Wait for a job slot
+            while [[ ${#CHILD_PIDS[@]} -ge $JOBS ]]; do
+                local new_pids=()
+                for pid in "${CHILD_PIDS[@]}"; do
+                    if kill -0 "$pid" 2>/dev/null; then
+                        new_pids+=("$pid")
+                    else
+                        wait "$pid" 2>/dev/null || true
+                    fi
+                done
+                if [[ ${#new_pids[@]} -gt 0 ]]; then
+                    CHILD_PIDS=("${new_pids[@]}")
+                else
+                    CHILD_PIDS=()
+                fi
+                [[ ${#CHILD_PIDS[@]} -ge $JOBS ]] && sleep 0.5
+            done
+
+            local result_file="${results_dir}/${index}.result"
+            echo ""
+            print_separator
+            echo -e "\n  ${BOLD}[${index}/${TOTAL_FILES}]${NC}"
+
+            (
+                convert_file "$file" "$output" "$result_file"
+            ) &
+            CHILD_PIDS+=($!)
+        done
+
+        # Wait for all remaining jobs
+        for pid in "${CHILD_PIDS[@]+"${CHILD_PIDS[@]}"}"; do
+            wait "$pid" 2>/dev/null || true
+        done
+        CHILD_PIDS=()
+
+        # Collect results
+        for rf in "${results_dir}"/*.result; do
+            [[ -f "$rf" ]] || continue
+            local status orig new
+            read -r status orig new < "$rf"
+            if [[ "$status" == "ok" ]]; then
+                PROCESSED=$((PROCESSED + 1))
+                TOTAL_ORIGINAL_SIZE=$((TOTAL_ORIGINAL_SIZE + orig))
+                TOTAL_COMPRESSED_SIZE=$((TOTAL_COMPRESSED_SIZE + new))
+            else
+                FAILED=$((FAILED + 1))
+            fi
+        done
+        rm -rf "$results_dir"
+    else
+        # --- Sequential mode ---
+        for file in "${files[@]}"; do
+            index=$((index + 1))
+            local filename output_name
+            filename=$(basename "$file")
+            output_name="${filename%.*}.mp4"
+            local output="${OUTPUT_DIR}/${output_name}"
+
+            echo ""
+            print_separator
+            echo -e "\n  ${BOLD}[${index}/${TOTAL_FILES}]${NC}"
+
+            # Check if already converted
+            if ! $FORCE && grep -qxF "$filename" "$done_file" 2>/dev/null && [[ -f "$output" ]]; then
+                echo -e "  ${DIM}File:${NC}        ${filename}"
+                echo -e "  ${CYAN}Skipped (already converted)${NC}"
+                SKIPPED=$((SKIPPED + 1))
+                continue
+            fi
+
+            if convert_file "$file" "$output"; then
+                PROCESSED=$((PROCESSED + 1))
+            else
+                echo -e "\n  ${RED}Failed to convert: ${filename}${NC}"
+                FAILED=$((FAILED + 1))
+            fi
+        done
+    fi
 
     echo ""
     print_separator
