@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 
 # --- Defaults ---
 CRF=24
@@ -53,6 +53,7 @@ DRY_RUN_WOULD_CONVERT=0
 DRY_RUN_DOWNSCALED=0
 INPUT_FILES=()
 CHILD_PIDS=()
+BARS_ACTIVE=false
 
 # --- Helpers ---
 
@@ -354,6 +355,12 @@ cleanup() {
     echo -e "  ${YELLOW}Interrupted!${NC}"
 
     if [[ $JOBS -gt 1 ]]; then
+        # Clear progress bars if active
+        if $BARS_ACTIVE; then
+            printf "\033[${JOBS}A"
+            for ((s=0; s<JOBS; s++)); do printf "\033[2K\n"; done
+            BARS_ACTIVE=false
+        fi
         # Kill all active child processes
         for pid in "${CHILD_PIDS[@]+"${CHILD_PIDS[@]}"}"; do
             kill "$pid" 2>/dev/null || true
@@ -398,7 +405,6 @@ trap cleanup SIGINT SIGTERM
 convert_file() {
     local input="$1"
     local output="$2"
-    local result_file="${3:-}"
     local temp="${output}.tmp.mp4"
     local filename
     filename=$(basename "$input")
@@ -508,56 +514,47 @@ convert_file() {
 
     FFMPEG_PID=$!
 
-    if [[ $JOBS -gt 1 ]]; then
-        # Parallel mode: just wait, no progress bar
-        wait "$FFMPEG_PID"
-        local exit_code=$?
-        FFMPEG_PID=""
-        rm -f "$progress_file"
-        CURRENT_PROGRESS=""
-    else
-        # Poll progress file and draw progress bar
-        while kill -0 "$FFMPEG_PID" 2>/dev/null; do
-            if [[ -f "$progress_file" && $total_us -gt 0 ]]; then
-                local cur_us speed cur_bytes
-                eval "$(awk -F= '
-                    /^out_time_us/{us=$2}
-                    /^speed/{sp=$2}
-                    /^total_size/{sz=$2}
-                    END{printf "cur_us=%d speed=\"%s\" cur_bytes=%d", us+0, sp, sz+0}
-                ' "$progress_file" 2>/dev/null)"
-                speed=${speed// /}
+    # Poll progress file and draw progress bar
+    while kill -0 "$FFMPEG_PID" 2>/dev/null; do
+        if [[ -f "$progress_file" && $total_us -gt 0 ]]; then
+            local cur_us speed cur_bytes
+            eval "$(awk -F= '
+                /^out_time_us/{us=$2}
+                /^speed/{sp=$2}
+                /^total_size/{sz=$2}
+                END{printf "cur_us=%d speed=\"%s\" cur_bytes=%d", us+0, sp, sz+0}
+            ' "$progress_file" 2>/dev/null)"
+            speed=${speed// /}
 
-                if [[ -n "$cur_us" && "$cur_us" != "0" ]]; then
-                    local pct=$(( cur_us * 100 / total_us ))
-                    [[ $pct -gt 100 ]] && pct=100
+            if [[ -n "$cur_us" && "$cur_us" != "0" ]]; then
+                local pct=$(( cur_us * 100 / total_us ))
+                [[ $pct -gt 100 ]] && pct=100
 
-                    local eta=0
-                    local elapsed=$(( $(date +%s) - conv_start ))
-                    if [[ $pct -gt 0 && $elapsed -gt 0 ]]; then
-                        eta=$(( elapsed * (100 - pct) / pct ))
-                    fi
-
-                    local projected=0
-                    if [[ $pct -gt 2 && $cur_bytes -gt 0 ]]; then
-                        projected=$(( cur_bytes * 100 / pct ))
-                    fi
-
-                    draw_progress "$pct" "${speed:-?}" "$eta" "$projected"
+                local eta=0
+                local elapsed=$(( $(date +%s) - conv_start ))
+                if [[ $pct -gt 0 && $elapsed -gt 0 ]]; then
+                    eta=$(( elapsed * (100 - pct) / pct ))
                 fi
+
+                local projected=0
+                if [[ $pct -gt 2 && $cur_bytes -gt 0 ]]; then
+                    projected=$(( cur_bytes * 100 / pct ))
+                fi
+
+                draw_progress "$pct" "${speed:-?}" "$eta" "$projected"
             fi
-            sleep 1
-        done
+        fi
+        sleep 1
+    done
 
-        wait "$FFMPEG_PID"
-        local exit_code=$?
-        FFMPEG_PID=""
+    wait "$FFMPEG_PID"
+    local exit_code=$?
+    FFMPEG_PID=""
 
-        # Clear progress bar line and clean up progress file
-        printf "\r%80s\r" ""
-        rm -f "$progress_file"
-        CURRENT_PROGRESS=""
-    fi
+    # Clear progress bar line and clean up progress file
+    printf "\r%80s\r" ""
+    rm -f "$progress_file"
+    CURRENT_PROGRESS=""
 
     if [[ $exit_code -ne 0 ]]; then
         # Show error log for real failures (not interrupts)
@@ -571,7 +568,6 @@ convert_file() {
         fi
         rm -f "$temp" "$error_log"
         CURRENT_TEMP=""
-        [[ -n "$result_file" ]] && echo "fail" > "$result_file"
         return 1
     fi
 
@@ -595,12 +591,8 @@ convert_file() {
     echo -e "  ${GREEN}Done${NC} in $(format_duration $conv_elapsed)"
     echo -e "  ${DIM}New size:${NC}    $(human_size "$new_size") (${GREEN}${pct}%${NC} of original, saved ${GREEN}$(human_size $saved)${NC})"
 
-    if [[ -n "$result_file" ]]; then
-        echo "ok $orig_size $new_size" > "$result_file"
-    else
-        TOTAL_ORIGINAL_SIZE=$((TOTAL_ORIGINAL_SIZE + orig_size))
-        TOTAL_COMPRESSED_SIZE=$((TOTAL_COMPRESSED_SIZE + new_size))
-    fi
+    TOTAL_ORIGINAL_SIZE=$((TOTAL_ORIGINAL_SIZE + orig_size))
+    TOTAL_COMPRESSED_SIZE=$((TOTAL_COMPRESSED_SIZE + new_size))
 
     if $REPLACE; then
         rm "$input"
@@ -609,6 +601,75 @@ convert_file() {
 
     # Record completion
     echo "$filename" >> "${OUTPUT_DIR}/.done"
+}
+
+# Worker function for parallel mode — runs in subshell, no display output
+run_conversion() {
+    local input="$1"
+    local output="$2"
+    local result_file="$3"
+    local temp="${output}.tmp.mp4"
+    local error_log="${temp}.err"
+
+    rm -f "$temp"
+
+    local orig_size
+    orig_size=$(file_size "$input")
+
+    # Build scale filter
+    local vf_args=()
+    if [[ $MAX_WIDTH -gt 0 ]]; then
+        vf_args=(-vf "scale='min(${MAX_WIDTH},iw)':-2")
+    fi
+
+    # Build encoder args
+    local encoder_args=()
+    if $SOFTWARE; then
+        encoder_args=(
+            -c:v libx265 -crf "$CRF" -preset "$PRESET"
+            -x265-params log-level=error
+            -tag:v hvc1
+        )
+    else
+        local vtq
+        vtq=$(( 100 - (CRF * 100 / 51) ))
+        [[ $vtq -lt 1 ]] && vtq=1
+        [[ $vtq -gt 100 ]] && vtq=100
+        encoder_args=(
+            -c:v hevc_videotoolbox -q:v "$vtq"
+            -tag:v hvc1
+        )
+    fi
+
+    ffmpeg -loglevel error -progress "${temp}.progress" -i "$input" \
+        "${encoder_args[@]}" \
+        ${vf_args[@]+"${vf_args[@]}"} \
+        -c:a aac -b:a "$AUDIO_BITRATE" \
+        -movflags +faststart \
+        -n \
+        "$temp" </dev/null >"$error_log" 2>&1
+    local exit_code=$?
+
+    rm -f "${temp}.progress"
+
+    if [[ $exit_code -ne 0 ]]; then
+        rm -f "$temp" "$error_log"
+        echo "fail $orig_size 0" > "$result_file"
+        return 1
+    fi
+
+    rm -f "$error_log"
+    mv "$temp" "$output"
+
+    local new_size
+    new_size=$(file_size "$output")
+    echo "ok $orig_size $new_size" > "$result_file"
+
+    if $REPLACE; then
+        rm "$input"
+    fi
+
+    echo "$(basename "$input")" >> "${OUTPUT_DIR}/.done"
 }
 
 main() {
@@ -674,11 +735,14 @@ main() {
 
     local index=0
 
-    if [[ $JOBS -gt 1 ]]; then
-        # --- Parallel mode ---
+    if [[ $JOBS -gt 1 ]] && ! $DRY_RUN; then
+        # --- Parallel mode with progress bars ---
         local results_dir="${OUTPUT_DIR}/.results"
         rm -rf "$results_dir"
         mkdir -p "$results_dir"
+
+        # Build processing queue (skip already-done files)
+        local -a pq_file=() pq_output=() pq_name=() pq_dur=() pq_idx=()
 
         for file in "${files[@]}"; do
             index=$((index + 1))
@@ -687,62 +751,190 @@ main() {
             output_name="${filename%.*}.mp4"
             local output="${OUTPUT_DIR}/${output_name}"
 
-            # Check if already converted
             if ! $FORCE && grep -qxF "$filename" "$done_file" 2>/dev/null && [[ -f "$output" ]]; then
                 echo -e "  ${CYAN}Skipped${NC} ${filename} (already converted)"
                 SKIPPED=$((SKIPPED + 1))
                 continue
             fi
 
-            # Wait for a job slot
-            while [[ ${#CHILD_PIDS[@]} -ge $JOBS ]]; do
-                local new_pids=()
-                for pid in "${CHILD_PIDS[@]}"; do
-                    if kill -0 "$pid" 2>/dev/null; then
-                        new_pids+=("$pid")
-                    else
-                        wait "$pid" 2>/dev/null || true
-                    fi
-                done
-                if [[ ${#new_pids[@]} -gt 0 ]]; then
-                    CHILD_PIDS=("${new_pids[@]}")
-                else
-                    CHILD_PIDS=()
-                fi
-                [[ ${#CHILD_PIDS[@]} -ge $JOBS ]] && sleep 0.5
+            # Probe duration for progress calculation
+            local dur_s
+            dur_s=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$file" 2>/dev/null || echo "0")
+            local total_us=0
+            if [[ "$dur_s" != "0" && "$dur_s" != "?" && "$dur_s" != "N/A" ]]; then
+                total_us=$(echo "scale=0; ${dur_s} * 1000000 / 1" | bc)
+            fi
+
+            pq_file+=("$file")
+            pq_output+=("$output")
+            pq_name+=("$filename")
+            pq_dur+=("$total_us")
+            pq_idx+=("$index")
+        done
+
+        local pq_len=${#pq_file[@]}
+
+        if [[ $pq_len -gt 0 ]]; then
+            # Slot state arrays (indexed by slot 0..JOBS-1)
+            local -a sl_pid=() sl_name=() sl_pf=() sl_dur=() sl_start=() sl_rf=() sl_done=()
+            for ((s=0; s<JOBS; s++)); do
+                sl_pid[$s]=""
+                sl_name[$s]=""
+                sl_pf[$s]=""
+                sl_dur[$s]=0
+                sl_start[$s]=0
+                sl_rf[$s]=""
+                sl_done[$s]=""
             done
 
-            local result_file="${results_dir}/${index}.result"
+            local pq_pos=0 active=0
+
+            # Reserve lines for progress bars
             echo ""
-            print_separator
-            echo -e "\n  ${BOLD}[${index}/${TOTAL_FILES}]${NC}"
+            for ((s=0; s<JOBS; s++)); do echo ""; done
+            BARS_ACTIVE=true
 
-            (
-                convert_file "$file" "$output" "$result_file"
-            ) &
-            CHILD_PIDS+=($!)
-        done
+            while [[ $active -gt 0 || $pq_pos -lt $pq_len ]]; do
+                # --- Check for completed jobs ---
+                for ((s=0; s<JOBS; s++)); do
+                    [[ -z "${sl_pid[$s]}" ]] && continue
 
-        # Wait for all remaining jobs
-        for pid in "${CHILD_PIDS[@]+"${CHILD_PIDS[@]}"}"; do
-            wait "$pid" 2>/dev/null || true
-        done
-        CHILD_PIDS=()
+                    if [[ -f "${sl_rf[$s]}" ]] || ! kill -0 "${sl_pid[$s]}" 2>/dev/null; then
+                        wait "${sl_pid[$s]}" 2>/dev/null || true
+                        active=$((active - 1))
 
-        # Collect results
-        for rf in "${results_dir}"/*.result; do
-            [[ -f "$rf" ]] || continue
-            local status orig new
-            read -r status orig new < "$rf"
-            if [[ "$status" == "ok" ]]; then
-                PROCESSED=$((PROCESSED + 1))
-                TOTAL_ORIGINAL_SIZE=$((TOTAL_ORIGINAL_SIZE + orig))
-                TOTAL_COMPRESSED_SIZE=$((TOTAL_COMPRESSED_SIZE + new))
-            else
-                FAILED=$((FAILED + 1))
-            fi
-        done
-        rm -rf "$results_dir"
+                        local r_elapsed=$(($(date +%s) - sl_start[$s]))
+                        if [[ -f "${sl_rf[$s]}" ]]; then
+                            local r_status r_orig r_new
+                            read -r r_status r_orig r_new < "${sl_rf[$s]}"
+                            if [[ "$r_status" == "ok" ]]; then
+                                PROCESSED=$((PROCESSED + 1))
+                                TOTAL_ORIGINAL_SIZE=$((TOTAL_ORIGINAL_SIZE + r_orig))
+                                TOTAL_COMPRESSED_SIZE=$((TOTAL_COMPRESSED_SIZE + r_new))
+                                local r_pct="?"
+                                local r_saved=0
+                                if [[ $r_orig -gt 0 ]]; then
+                                    r_pct=$(printf "%.1f" "$(echo "$r_new * 100 / $r_orig" | bc -l)")
+                                    r_saved=$((r_orig - r_new))
+                                fi
+                                sl_done[$s]="${GREEN}Done${NC} $(format_duration $r_elapsed) — $(human_size $r_new) (${GREEN}${r_pct}%${NC}, saved ${GREEN}$(human_size $r_saved)${NC})"
+                            else
+                                FAILED=$((FAILED + 1))
+                                sl_done[$s]="${RED}Failed${NC}"
+                            fi
+                        else
+                            FAILED=$((FAILED + 1))
+                            sl_done[$s]="${RED}Failed${NC}"
+                        fi
+
+                        sl_pid[$s]=""
+                    fi
+                done
+
+                # --- Fill empty slots from queue ---
+                while [[ $active -lt $JOBS && $pq_pos -lt $pq_len ]]; do
+                    # Find a free slot (prefer one without a "done" message)
+                    local slot=-1
+                    for ((s=0; s<JOBS; s++)); do
+                        if [[ -z "${sl_pid[$s]}" && -z "${sl_done[$s]}" ]]; then
+                            slot=$s; break
+                        fi
+                    done
+                    if [[ $slot -lt 0 ]]; then
+                        for ((s=0; s<JOBS; s++)); do
+                            [[ -z "${sl_pid[$s]}" ]] && { slot=$s; break; }
+                        done
+                    fi
+                    [[ $slot -lt 0 ]] && break
+
+                    ( run_conversion "${pq_file[$pq_pos]}" "${pq_output[$pq_pos]}" \
+                        "${results_dir}/${pq_idx[$pq_pos]}.result" ) &
+
+                    sl_pid[$slot]=$!
+                    sl_name[$slot]="${pq_name[$pq_pos]}"
+                    sl_pf[$slot]="${pq_output[$pq_pos]}.tmp.mp4.progress"
+                    sl_dur[$slot]="${pq_dur[$pq_pos]}"
+                    sl_start[$slot]=$(date +%s)
+                    sl_rf[$slot]="${results_dir}/${pq_idx[$pq_pos]}.result"
+                    sl_done[$slot]=""
+                    active=$((active + 1))
+                    pq_pos=$((pq_pos + 1))
+
+                    # Update CHILD_PIDS for cleanup handler
+                    CHILD_PIDS=()
+                    for ((s2=0; s2<JOBS; s2++)); do
+                        [[ -n "${sl_pid[$s2]}" ]] && CHILD_PIDS+=("${sl_pid[$s2]}")
+                    done
+                done
+
+                # --- Draw progress bars ---
+                printf "\033[${JOBS}A"
+                for ((s=0; s<JOBS; s++)); do
+                    printf "\r\033[2K"
+                    if [[ -n "${sl_pid[$s]:-}" ]]; then
+                        # Active slot — draw progress bar
+                        local p_name="${sl_name[$s]}"
+                        [[ ${#p_name} -gt 18 ]] && p_name="${p_name:0:15}..."
+                        local pf="${sl_pf[$s]}"
+                        local p_total="${sl_dur[$s]}"
+
+                        local p_pct=0 p_spd="..." p_eta="" p_proj=""
+                        if [[ -f "$pf" && $p_total -gt 0 ]]; then
+                            local p_cus=0 p_sp="" p_cb=0
+                            eval "$(awk -F= '
+                                /^out_time_us/{us=$2}
+                                /^speed/{sp=$2}
+                                /^total_size/{sz=$2}
+                                END{printf "p_cus=%d p_sp=\"%s\" p_cb=%d", us+0, sp, sz+0}
+                            ' "$pf" 2>/dev/null)" 2>/dev/null || true
+                            p_sp=${p_sp// /}
+
+                            if [[ $p_cus -gt 0 ]]; then
+                                p_pct=$((p_cus * 100 / p_total))
+                                [[ $p_pct -gt 100 ]] && p_pct=100
+                                p_spd="${p_sp:-?}"
+
+                                local p_el=$(($(date +%s) - sl_start[$s]))
+                                if [[ $p_pct -gt 0 && $p_el -gt 0 ]]; then
+                                    local p_eta_s=$((p_el * (100 - p_pct) / p_pct))
+                                    [[ $p_eta_s -gt 0 ]] && p_eta="ETA $(format_duration $p_eta_s)"
+                                fi
+
+                                if [[ $p_pct -gt 2 && $p_cb -gt 0 ]]; then
+                                    p_proj="~$(human_size $((p_cb * 100 / p_pct)))"
+                                fi
+                            fi
+                        fi
+
+                        # Draw compact bar
+                        local bw=20 filled=$((p_pct * bw / 100)) empty=$((bw - filled))
+                        local bar=""
+                        local i
+                        for ((i=0; i<filled; i++)); do bar+="\xe2\x96\x88"; done
+                        for ((i=0; i<empty; i++)); do bar+="\xe2\x96\x91"; done
+
+                        printf "  ${DIM}%-18s${NC} ${bar} %3d%%  %6s  %-14s %s" \
+                            "$p_name" "$p_pct" "$p_spd" "$p_eta" "$p_proj"
+                    elif [[ -n "${sl_done[$s]:-}" ]]; then
+                        # Completed slot — show result
+                        local d_name="${sl_name[$s]}"
+                        [[ ${#d_name} -gt 18 ]] && d_name="${d_name:0:15}..."
+                        printf "  ${DIM}%-18s${NC} %b" "$d_name" "${sl_done[$s]}"
+                    fi
+                    printf "\n"
+                done
+
+                sleep 0.5
+            done
+
+            # Clear progress area
+            printf "\033[${JOBS}A"
+            for ((s=0; s<JOBS; s++)); do printf "\033[2K\n"; done
+            BARS_ACTIVE=false
+
+            CHILD_PIDS=()
+            rm -rf "$results_dir"
+        fi
     else
         # --- Sequential mode ---
         for file in "${files[@]}"; do
