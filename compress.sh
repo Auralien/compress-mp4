@@ -2,12 +2,12 @@
 #
 # compress.sh - compress-mp4: Batch video compressor using H.265/HEVC
 #
-# Converts MP4/MOV videos to H.265/HEVC with optional downscaling.
+# Converts MP4/MOV/AVI videos to H.265/HEVC with optional downscaling.
 # Supports resume — stop anytime and restart to pick up where you left off.
 
 set -euo pipefail
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 # --- Defaults ---
 CRF=24
@@ -58,9 +58,9 @@ usage() {
     cat <<EOF
 Usage: ./compress.sh [OPTIONS] [FILE ...]
 
-Batch compress MP4/MOV videos using H.265/HEVC.
+Batch compress MP4/MOV/AVI videos using H.265/HEVC.
 
-If no files are given, all .mp4 and .mov files in the current directory are processed.
+If no files are given, all .mp4, .mov, and .avi files in the current directory are processed.
 If one or more files are given, only those files are processed.
 Compressed files are written to an output directory (always as .mp4). The script tracks
 completed files, so you can stop it anytime (Ctrl+C) and resume later.
@@ -598,7 +598,7 @@ main() {
             files+=("$f")
         done
     else
-        for f in *.mp4 *.mov *.MOV *.MP4; do
+        for f in *.mp4 *.mov *.avi *.MOV *.MP4 *.AVI; do
             [[ -f "$f" ]] || continue
             [[ "$f" == *.tmp.mp4 ]] && continue
             files+=("$f")
@@ -606,7 +606,7 @@ main() {
     fi
 
     if [[ ${#files[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}No .mp4 or .mov files found in the current directory.${NC}"
+        echo -e "${YELLOW}No video files (.mp4, .mov, .avi) found in the current directory.${NC}"
         exit 0
     fi
 
