@@ -872,7 +872,7 @@ main() {
                 # --- Draw progress bars + overall status ---
                 printf "\033[${bar_lines}A"
                 for ((s=0; s<JOBS; s++)); do
-                    printf "\r\033[2K"
+                    printf "\r"
                     if [[ -n "${sl_pid[$s]:-}" ]]; then
                         # Active slot — draw progress bar
                         local p_name="${sl_name[$s]}"
@@ -925,17 +925,17 @@ main() {
                         [[ ${#d_name} -gt 18 ]] && d_name="${d_name:0:15}..."
                         printf "  ${DIM}%-18s${NC} %b" "$d_name" "${sl_done[$s]}"
                     fi
-                    printf "\n"
+                    printf "\033[K\n"
                 done
 
                 # Overall status line
-                printf "\r\033[2K"
+                printf "\r"
                 local done_count=$((PROCESSED + FAILED + SKIPPED))
                 local elapsed=$(($(date +%s) - START_TIME))
                 printf "  ${DIM}Overall:${NC} ${BOLD}%d${NC}/${BOLD}%d${NC} done" "$done_count" "$TOTAL_FILES"
                 [[ $FAILED -gt 0 ]] && printf "  ${RED}%d failed${NC}" "$FAILED"
                 [[ $elapsed -gt 0 ]] && printf "  ${DIM}(%s elapsed)${NC}" "$(format_duration $elapsed)"
-                printf "\n"
+                printf "\033[K\n"
 
                 sleep 0.5
             done
