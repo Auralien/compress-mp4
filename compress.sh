@@ -357,8 +357,9 @@ cleanup() {
     if [[ $JOBS -gt 1 ]]; then
         # Clear progress bars if active
         if $BARS_ACTIVE; then
-            printf "\033[${JOBS}A"
-            for ((s=0; s<JOBS; s++)); do printf "\033[2K\n"; done
+            local bar_lines=$((JOBS + 1))
+            printf "\033[${bar_lines}A"
+            for ((s=0; s<=JOBS; s++)); do printf "\033[2K\n"; done
             BARS_ACTIVE=false
         fi
         # Kill all active child processes
@@ -789,9 +790,10 @@ main() {
 
             local pq_pos=0 active=0
 
-            # Reserve lines for progress bars
+            # Reserve lines for progress bars + overall status
+            local bar_lines=$((JOBS + 1))
             echo ""
-            for ((s=0; s<JOBS; s++)); do echo ""; done
+            for ((s=0; s<bar_lines; s++)); do echo ""; done
             BARS_ACTIVE=true
 
             while [[ $active -gt 0 || $pq_pos -lt $pq_len ]]; do
@@ -867,8 +869,8 @@ main() {
                     done
                 done
 
-                # --- Draw progress bars ---
-                printf "\033[${JOBS}A"
+                # --- Draw progress bars + overall status ---
+                printf "\033[${bar_lines}A"
                 for ((s=0; s<JOBS; s++)); do
                     printf "\r\033[2K"
                     if [[ -n "${sl_pid[$s]:-}" ]]; then
@@ -926,12 +928,21 @@ main() {
                     printf "\n"
                 done
 
+                # Overall status line
+                printf "\r\033[2K"
+                local done_count=$((PROCESSED + FAILED + SKIPPED))
+                local elapsed=$(($(date +%s) - START_TIME))
+                printf "  ${DIM}Overall:${NC} ${BOLD}%d${NC}/${BOLD}%d${NC} done" "$done_count" "$TOTAL_FILES"
+                [[ $FAILED -gt 0 ]] && printf "  ${RED}%d failed${NC}" "$FAILED"
+                [[ $elapsed -gt 0 ]] && printf "  ${DIM}(%s elapsed)${NC}" "$(format_duration $elapsed)"
+                printf "\n"
+
                 sleep 0.5
             done
 
             # Clear progress area
-            printf "\033[${JOBS}A"
-            for ((s=0; s<JOBS; s++)); do printf "\033[2K\n"; done
+            printf "\033[${bar_lines}A"
+            for ((s=0; s<bar_lines; s++)); do printf "\033[2K\n"; done
             BARS_ACTIVE=false
 
             CHILD_PIDS=()
